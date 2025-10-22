@@ -1,0 +1,38 @@
+﻿<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Registrar OS</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="bg">
+<a class="brand-logo" href="/">
+  <img src="{{ url_for('static', filename='imagens/zhaz-logo.png') }}" alt="ZHAZ">
+  <span class="wordmark">ZHAZ</span>
+  <span class="tagline">Soluções de A a Z</span>
+</a>
+<div class="wrap">
+  <h1 class="title">Registrar OS</h1>
+  <div class="card">
+    <label>Nº OS</label>
+    <input id="os" class="input">
+    <label>Equipamento</label>
+    <input id="eq" class="input">
+    <label>Defeito</label>
+    <input id="df" class="input">
+    <button class="btn btn-verde" id="ok">Salvar</button>
+  </div>
+</div>
+<script>
+async function post(u,b){
+  const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
+  if(!r.ok){const e=await r.json().catch(()=>({erro:'Erro'}));alert(e.erro||'Erro');throw new Error();}
+  return r.json();
+}
+ok.onclick=async()=>{
+  await post('/registrar_os',{os_numero:os.value.trim(),equipamento:eq.value.trim(),defeito:df.value.trim()});
+  alert('OS registrada e SLA iniciado!');
+};
+</script>
+</body>
+</html>
