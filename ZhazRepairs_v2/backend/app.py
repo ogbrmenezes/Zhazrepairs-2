@@ -152,6 +152,139 @@ def m_por_modelo():
     cur.execute("SELECT equipamento, SUM(CASE WHEN resultado='REPARADA' THEN 1 ELSE 0 END), SUM(CASE WHEN resultado='NAO_REPARADA' THEN 1 ELSE 0 END), COUNT(*) FROM os WHERE resultado IN ('REPARADA','NAO_REPARADA') GROUP BY equipamento ORDER BY 4 DESC")
     rows=[dict(equipamento=r[0],reparadas=r[1],nao_reparadas=r[2],total=r[3]) for r in cur.fetchall()]; conn.close(); return jsonify(rows)
 
+
+
+# ====== Métricas por reparador (Admin que libera para teste) ======
+@app.get("/api/metrics/reparador")
+@require_login
+@require_roles('DIRETORIA','ADMIN')
+def metrics_reparador():
+    # pode vir por query ?reparador=email  | se não vier e for ADMIN, usa o usuário logado
+    reparador = (request.args.get("reparador") or "").strip().lower()
+    if not reparador and session.get('papel') == 'ADMIN':
+        reparador = (session.get('usuario') or "").lower()
+
+    if not reparador:
+        return jsonify({"erro":"Informe ?reparador=<email> ou faça login como ADMIN"}), 400
+
+    conn = get_conn(); cur = conn.cursor()
+
+    # OS tratadas por esse reparador: as que ele marcou "Liberada para teste"
+    cur.execute("""
+        SELECT DISTINCT h.os_id
+        FROM status_history h
+        WHERE h.status='Liberada para teste' AND LOWER(h.changed_by)=?
+    """, (reparador,))
+    os_ids = [r[0] for r in cur.fetchall()]
+    if not os_ids:
+        conn.close()
+        return jsonify({
+            "reparador": {"email": reparador},
+            "cards": {"total": 0, "reparadas": 0, "nao_reparadas": 0, "taxa_sucesso_pct": 0.0},
+            "time": {"mttr_dias": 0.0, "lead_time_30d": 0.0},
+            "trend": [], "top_equipamentos": [], "last_activities": []
+        })
+
+    ids_tuple = tuple(os_ids)
+    where_ids = f"IN ({','.join(['?']*len(os_ids))})"
+
+    # contagens finais das OS que ele liberou
+    cur.execute(f"""
+        SELECT
+          SUM(CASE WHEN resultado='REPARADA'     THEN 1 ELSE 0 END) AS reparadas,
+          SUM(CASE WHEN resultado='NAO_REPARADA' THEN 1 ELSE 0 END) AS nao_reparadas,
+          COUNT(*) AS total
+        FROM os
+        WHERE id {where_ids}
+    """, os_ids)
+    c = cur.fetchone()
+    total = c["total"] or 0
+    rep  = c["reparadas"] or 0
+    nrep = c["nao_reparadas"] or 0
+    taxa = (rep/total*100.0) if total else 0.0
+
+    # MTTR/Lead time sobre as OS que ele tratou
+    cur.execute(f"""
+        SELECT AVG(julianday(resultado_em) - julianday(sla_inicio))
+        FROM os
+        WHERE id {where_ids} AND resultado_em IS NOT NULL AND sla_inicio IS NOT NULL
+    """, os_ids)
+    mttr = cur.fetchone()[0] or 0.0
+
+    cur.execute(f"""
+        SELECT AVG(julianday(resultado_em) - julianday(data_registro))
+        FROM os
+        WHERE id {where_ids} AND resultado_em IS NOT NULL
+          AND date(resultado_em) >= date('now','localtime','-30 day')
+    """, os_ids)
+    lead30 = cur.fetchone()[0] or 0.0
+
+    # tendência (14 dias) considerando as OS dele: entradas e saídas dessas OS
+    cur.execute(f"""
+    WITH dias AS (
+      SELECT date('now','localtime','-13 day') d
+      UNION ALL SELECT date('now','localtime','-12 day')
+      UNION ALL SELECT date('now','localtime','-11 day')
+      UNION ALL SELECT date('now','localtime','-10 day')
+      UNION ALL SELECT date('now','localtime','-9 day')
+      UNION ALL SELECT date('now','localtime','-8 day')
+      UNION ALL SELECT date('now','localtime','-7 day')
+      UNION ALL SELECT date('now','localtime','-6 day')
+      UNION ALL SELECT date('now','localtime','-5 day')
+      UNION ALL SELECT date('now','localtime','-4 day')
+      UNION ALL SELECT date('now','localtime','-3 day')
+      UNION ALL SELECT date('now','localtime','-2 day')
+      UNION ALL SELECT date('now','localtime','-1 day')
+      UNION ALL SELECT date('now','localtime')
+    )
+    SELECT
+      d AS dia,
+      (SELECT COUNT(*) FROM os o WHERE o.id {where_ids} AND date(o.data_registro)=d) AS entradas,
+      (SELECT COUNT(*) FROM os o WHERE o.id {where_ids} AND date(COALESCE(o.resultado_em,''))=d) AS saidas
+    FROM dias
+    """, os_ids*2)
+    trend = [dict(r) for r in cur.fetchall()]
+
+    # top equipamentos (nas OS dele) por taxa de sucesso
+    cur.execute(f"""
+        SELECT
+          equipamento,
+          SUM(CASE WHEN resultado='REPARADA'     THEN 1 ELSE 0 END) AS reparadas,
+          SUM(CASE WHEN resultado='NAO_REPARADA' THEN 1 ELSE 0 END) AS nao_reparadas,
+          COUNT(*) AS total
+        FROM os
+        WHERE id {where_ids}
+        GROUP BY equipamento
+        HAVING total >= 3
+        ORDER BY (CAST(reparadas AS REAL)/NULLIF(total,0)) DESC, total DESC
+        LIMIT 10
+    """, os_ids)
+    top_eqp = [dict(r) for r in cur.fetchall()]
+
+    # últimas atividades do reparador (o que ele próprio registrou)
+    cur.execute("""
+        SELECT h.os_id, o.os_numero AS numero, h.status, datetime(h.changed_at) AS quando
+        FROM status_history h
+        JOIN os o ON o.id=h.os_id
+        WHERE LOWER(h.changed_by)=?
+        ORDER BY h.changed_at DESC
+        LIMIT 25
+    """, (reparador,))
+    last = [dict(r) for r in cur.fetchall()]
+
+    conn.close()
+    return jsonify({
+        "reparador": {"email": reparador},
+        "cards": {"total": total, "reparadas": rep, "nao_reparadas": nrep, "taxa_sucesso_pct": round(taxa,1)},
+        "time": {"mttr_dias": mttr, "lead_time_30d": lead30},
+        "trend": trend,
+        "top_equipamentos": top_eqp,
+        "last_activities": last,
+    })
+
+
+
+
 @app.route('/api/metrics/ranking_tecnicos')
 @require_login
 @require_roles('ADMIN','DIRETORIA')
